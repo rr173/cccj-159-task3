@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>芯片 ECO 签核工作台</title>
+<style>
+  :root { --bg:#0f1522; --panel:#182030; --line:#2a3550; --txt:#dbe4f3;
+          --mut:#8494b3; --ok:#2fbf71; --bad:#e0556b; --warn:#e3a73a;
+          --accent:#4f8cff; --block:#6b7894; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:13px/1.55 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",monospace;
+         background:var(--bg); color:var(--txt); }
+  header { padding:14px 22px; border-bottom:1px solid var(--line); display:flex;
+           align-items:center; gap:14px; background:#121a29; }
+  header h1 { font-size:16px; margin:0; }
+  header .trunk { color:var(--mut); font-size:12px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:5px;
+           padding:6px 12px; cursor:pointer; font-size:12px; }
+  button.sec { background:#2c3a55; } button.danger{background:var(--bad);}
+  button:disabled { background:#333d52; color:#7c88a1; cursor:not-allowed; }
+  input,select,textarea { background:#0d1320; color:var(--txt); border:1px solid var(--line);
+           border-radius:4px; padding:5px 8px; font-size:12px; font-family:inherit; }
+  textarea { width:100%; min-height:60px; }
+  .wrap { display:grid; grid-template-columns: 1.05fr 1fr; gap:14px; padding:14px 22px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+           padding:14px; margin-bottom:14px; }
+  .panel h2 { font-size:13px; margin:0 0 10px; color:#9fb4da; letter-spacing:1px;
+              text-transform:uppercase; display:flex; justify-content:space-between; align-items:center;}
+  .card { border:1px solid var(--line); border-radius:7px; padding:10px 12px; margin-bottom:10px;
+          background:#121a29; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:6px 0; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:20px; font-size:11px; }
+  .s-DRAFT{background:#37425c;color:#c6d0e6} .s-FROZEN{background:#1e4a7a;color:#cfe3ff}
+  .s-QUEUED{background:#5c4a1e;color:#ffe7b0} .s-REBASE_REQUIRED{background:#5c3b1e;color:#ffd8b0}
+  .s-RELEASING{background:#4a2a66;color:#e7d1ff} .s-RELEASED{background:#155a38;color:#bdf3d5}
+  .s-ABORTED{background:#4a202a;color:#f3c3cd} .s-MERGED{background:#2e5557;color:#c2efec}
+  .c-PASS{color:var(--ok)} .c-FAIL{color:var(--bad)} .c-PENDING{color:var(--warn)}
+  .c-BLOCKED,.c-SUPERSEDED,.c-MISSING{color:var(--block)}
+  .chip { font-size:11px; padding:1px 7px; border:1px solid var(--line); border-radius:20px;color:var(--mut);}
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  td,th { padding:4px 6px; border-bottom:1px solid #222d44; text-align:left; vertical-align:top;}
+  th { color:var(--mut); font-weight:600; }
+  .mut{color:var(--mut)} .mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+  pre { white-space:pre-wrap; word-break:break-all; background:#0b111c; border:1px solid var(--line);
+        border-radius:6px; padding:8px; font-size:11px; max-height:340px; overflow:auto;}
+  #toast { position:fixed; right:18px; bottom:18px; max-width:420px; display:flex;
+           flex-direction:column; gap:8px; z-index:9; }
+  .toast { padding:9px 13px; border-radius:7px; background:#20304d; border:1px solid var(--line);
+           font-size:12px; } .toast.err{border-color:var(--bad);} .toast.ok{border-color:var(--ok);}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>🔧 芯片 ECO 签核工作台</h1>
+  <span class="trunk" id="trunk"></span>
+  <span style="flex:1"></span>
+  <button class="sec" onclick="refresh()">刷新</button>
+  <button class="danger" onclick="resetAll()">重置演示数据</button>
+</header>
+
+<div class="wrap">
+<div>
+  <div class="panel">
+    <h2>① 管理员配置临时代理签核</h2>
+    <div class="row mut">为两种签核角色指定临时可签自然人、生效/失效时间，可随时撤销。
+      服务端在<b>签核动作发生时</b>校验：未生效 / 已过期 / 已撤销一律拒绝。</div>
+    <div id="signers" class="row"></div>
+    <div class="grid2">
+      <select id="dlg-role">
+        <option value="TIMING_LEAD">时序负责人 TIMING_LEAD</option>
+        <option value="METHODOLOGY_LEAD">方法学负责人 METHODOLOGY_LEAD</option>
+      </select>
+      <input id="dlg-user" placeholder="代理人账号，如 backup.wang"/>
+    </div>
+    <div class="grid2">
+      <input id="dlg-principal" placeholder="被代理的负责人（可选，用于来源展示）"/>
+      <input id="dlg-admin" placeholder="配置管理员" value="admin.chen"/>
+    </div>
+    <div class="grid2">
+      <label class="mut">生效 <input id="dlg-from" type="datetime-local" style="width:100%"/></label>
+      <label class="mut">失效 <input id="dlg-until" type="datetime-local" style="width:100%"/></label>
+    </div>
+    <div class="row"><input id="dlg-note" style="flex:1" placeholder="备注（可选），如 负责人休假代理"/>
+      <button onclick="createDelegation()">配置代理</button></div>
+    <div id="delegations"></div>
+  </div>
+
+  <div class="panel">
+    <h2>② 提交 ECO（冻结网表 / 约束 / 模块 / 验证矩阵）</h2>
+    <div class="grid2">
+      <input id="f-title" placeholder="ECO 标题，如 ALU 时序修复"/>
+      <input id="f-owner" placeholder="负责人" value="wei.dong"/>
+    </div>
+    <div class="row">
+      <span class="mut">受影响模块（逗号分隔）：</span>
+      <input id="f-mods" style="flex:1" value="alu" placeholder="alu, core"/>
+    </div>
+    <div class="row mut">网表编辑（JSON，键为模块名）：</div>
+    <textarea id="f-edits" class="mono">{"alu":{"netlist":"MODULE alu; INPUT a b; CELL ADD u_add(a,b,s); CELL RETIMER u_rt; CELL MUX u_mux; ENDMODULE"}}</textarea>
+    <div class="row"><button onclick="createEco()">创建草稿</button>
+      <span class="mut">创建后在下方 ECO 卡片执行 冻结 → 跑检查 → 双签核 → 发布。</span></div>
+  </div>
+
+  <div class="panel">
+    <h2>③ ECO 队列与签核</h2>
+    <div id="ecos"></div>
+  </div>
+</div>
+
+<div>
+  <div class="panel">
+    <h2>④ 发布基线（不可变）与差异包</h2>
+    <div id="baselines"></div>
+    <div class="row">
+      <select id="d-from" style="flex:1"></select><span>→</span><select id="d-to" style="flex:1"></select>
+    </div>
+    <div class="row">
+      <button onclick="showDiff()">查看差异 JSON</button>
+      <button class="sec" onclick="downloadZip()">下载差异包 ZIP</button>
+    </div>
+    <pre id="diff" class="mut">（选择两个基线生成差异包）</pre>
+  </div>
+
+  <div class="panel">
+    <h2>⑤ 运营态势：锁 / 拒收留痕 / 审计</h2>
+    <div class="row"><b>模块锁：</b><span id="locks" class="mono"></span></div>
+    <div class="row mut">迟到、串基线、被作废的结果一律拒收，绝不拼接复用：</div>
+    <div id="rejects"></div>
+  </div>
+</div>
+</div>
+<div id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
