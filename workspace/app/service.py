@@ -407,10 +407,15 @@ class ECOService:
                 "scopes": spec["scopes"], "inputs": inputs,
             }
 
-    def submit_result(self, run_id, fingerprint, verdict, result=None, runner_id="runner-0"):
+    def submit_result(self, run_id, fingerprint, verdict, result=None, runner_id="runner-0",
+                      on_accept=None):
         """提交验证结果。指纹不符 / 已作废 / 前置未过 / 重复提交一律拒收，绝不复用。
 
         拒收记录在独立事务中持久化：校验事务回滚不影响审计留痕。
+
+        on_accept(cursor, run_row)：可选回调，**仅在全部基线指纹与依赖门禁通过、
+        check_run 落定的同一事务内**调用（租约协调器借此原子地完成租约，
+        接管后的结果同样必须先过这里的基线指纹/依赖门禁，无旁路）。
         """
         result = result or {}
         try:
@@ -452,6 +457,9 @@ class ECOService:
                 self._audit(c, "check.result", run_id, runner_id,
                             {"verdict": verdict, "check": run["check_type"]})
                 self._advance(c, run["eco_id"])
+                if on_accept is not None:
+                    on_accept(c, c.execute("SELECT * FROM check_run WHERE id=?",
+                                           (run_id,)).fetchone())
                 return self.eco_detail(run["eco_id"], c)
         except ECOError as e:
             if e.code == "RESULT_REJECTED":

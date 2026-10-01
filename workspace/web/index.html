@@ -130,6 +130,27 @@
     <div class="row mut">迟到、串基线、被作废的结果一律拒收，绝不拼接复用：</div>
     <div id="rejects"></div>
   </div>
+
+  <div class="panel">
+    <h2>⑥ 验证执行租约协调（待领任务 / 持有者 / 剩余时间 / 接管历史）</h2>
+    <div class="row mut">Runner 原子领取就绪检查（领取幂等、并发仅一个成功）；回传必须携带
+      <b>租约代次 generation</b> 与不可伪造凭据 <b>lease_token</b>。旧持有者、过期租约、
+      依赖未满足、重跑后旧代次迟到结果一律拒绝并入审计；超时后其他 Runner 可接管（代次+1），
+      接管结果仍走原 ECO 基线指纹/依赖门禁。</div>
+    <div class="row">
+      <span class="chip">Runner</span><input id="lz-runner" value="runner-0" style="width:130px"/>
+      <span class="chip">TTL秒</span><input id="lz-ttl" value="30" style="width:70px"/>
+      <button onclick="leaseClaimNext()">领取下一个就绪任务</button>
+      <button class="sec" onclick="loadLeases()">刷新租约</button>
+    </div>
+    <div class="row"><b>待领任务（就绪 PENDING）：</b></div>
+    <div id="lz-pool"></div>
+    <div class="row" style="margin-top:8px"><b>当前租约与持有者：</b></div>
+    <div id="lz-leases"></div>
+    <div class="row" style="margin-top:8px"><b>租约事件/拒绝审计：</b>
+      <span class="mut" id="lz-audit-count"></span></div>
+    <div id="lz-audit"></div>
+  </div>
 </div>
 </div>
 <div id="toast"></div>

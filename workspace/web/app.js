@@ -329,5 +329,142 @@ function renderMisc(w) {
     : '<div class="mut">（暂无拒收记录）</div>';
 }
 
+// ================= 验证执行租约协调操作台 =================
+const LEASE_STATE_CN = {HELD:"持有中", COMPLETED:"已完成", RELEASED:"已释放",
+                        EXPIRED:"已过期", INVALIDATED:"随纪元作废"};
+function ttlV(){ return parseInt($("lz-ttl").value||"30", 10); }
+function runnerV(){ return $("lz-runner").value.trim() || "runner-0"; }
+
+async function leaseClaimNext() {
+  try {
+    const d = await api("/api/leases/claim","POST",
+      {runner_id: runnerV(), idempotency_key: "ui-" + Date.now(), ttl_seconds: ttlV()});
+    if (!d.claimed) { toast("当前没有可领取的就绪任务（依赖可能尚未满足）","err"); return; }
+    toast(`已领取 ${d.check_type}（${d.run_id}）· 代次 g${d.generation}，TTL ${d.ttl_seconds}s`,"ok");
+    await loadLeases();
+  } catch(e){ toast("⛔ 领取被拒："+e.message+" "+(e.resp?.error?"["+e.resp.error+"]":""),"err"); await loadLeases(); }
+}
+
+async function leaseClaimRun(runId) {
+  try {
+    const d = await api("/api/leases/claim","POST",
+      {runner_id: runnerV(), idempotency_key: "ui-" + Date.now(), run_id: runId,
+       ttl_seconds: ttlV()});
+    toast(d.idempotent ? "幂等返回既有分配（未重复领取）" : `已领取 ${runId}`, "ok");
+  } catch(e){ toast("⛔ "+e.message+" ["+(e.resp?.error||"")+"]","err"); }
+  await loadLeases();
+}
+
+// 凭租约拉输入、自算指纹并回传结果（携带 generation + lease_token）
+async function leaseComplete(runId, checkType, ecoId, generation, token, verdict="PASS") {
+  try {
+    const pkt = await api(`/api/ecos/${ecoId}/checks/${checkType}/inputs`);
+    window.MATRIX = pkt.inputs.verification_matrix;
+    window.SNAP_MODULES = pkt.inputs.modules || {};
+    window.SNAP_CONS = pkt.inputs.constraints || {};
+    window.SNAP_AFFECTED = pkt.inputs.affected_modules || [];
+    const fp = await runnerFp(checkType);
+    const d = await api(`/api/leases/runs/${runId}/results`,"POST",
+      {runner_id: runnerV(), generation, lease_token: token, fingerprint: fp,
+       verdict, result: {note: verdict==="PASS"?"租约执行通过":"租约执行违例"}});
+    toast(`结果已接受：${checkType} ${verictNote(verdict)}（租约 COMPLETED，仍通过基线指纹/依赖门禁）`,"ok");
+  } catch(e){
+    toast("⛔ 结果拒收："+(e.resp?.detail?.reason||e.resp?.error||e.message),"err");
+  }
+  await loadLeases(); await refresh();
+}
+function verictNote(v){ return v==="PASS"?"PASS":"FAIL"; }
+
+async function leaseRenew(runId, generation, token) {
+  try {
+    const d = await api(`/api/leases/runs/${runId}/renew`,"POST",
+      {runner_id: runnerV(), generation, lease_token: token, ttl_seconds: ttlV()});
+    toast(`续租成功，剩余 ${d.remaining_seconds}s（心跳 ${d.renew_count} 次）`,"ok");
+  } catch(e){ toast("⛔ 续租被拒："+(e.resp?.error||e.message),"err"); }
+  await loadLeases();
+}
+async function leaseRelease(runId, generation, token) {
+  try { await api(`/api/leases/runs/${runId}/release`,"POST",
+    {runner_id: runnerV(), generation, lease_token: token});
+    toast("租约已主动释放，任务回到待领池","ok");
+  } catch(e){ toast("⛔ "+(e.resp?.error||e.message),"err"); }
+  await loadLeases();
+}
+async function leaseTakeover(runId) {
+  try {
+    const d = await api(`/api/leases/runs/${runId}/takeover`,"POST",
+      {by_runner: runnerV(), ttl_seconds: ttlV()});
+    toast(`超时接管成功：代次 g${d.previous.generation}→g${d.generation}，旧持有者凭据即刻失效`,"ok");
+  } catch(e){ toast("⛔ 接管被拒："+(e.resp?.error||e.message),"err"); }
+  await loadLeases();
+}
+async function leaseHistory(runId) {
+  try {
+    const d = await api(`/api/leases/runs/${runId}`);
+    const txt = d.history.map(h =>
+      `${(h.at||"").slice(11)} ${h.event} ${h.runner_id||""} g${h.generation??""}` +
+      (h.reason?` → ${h.reason}`:"")).join("\n");
+    toast(`<b>${runId}</b> 接管/事件历史：<pre style="margin:6px 0 0;white-space:pre-wrap">${esc(txt)}</pre>`);
+  } catch(e){ toast("⛔ "+e.message,"err"); }
+}
+
+async function loadLeases() {
+  const [pool, au] = await Promise.all([
+    api("/api/leases/pool"), api("/api/leases/audit?limit=15")]);
+  // 待领任务
+  $("lz-pool").innerHTML = pool.claimable.length
+    ? `<table><tr><th>ECO</th><th>检查</th><th>必需</th><th>依赖</th><th></th></tr>` +
+      pool.claimable.map(x=>`<tr>
+        <td class="mono">${x.eco_id}<div class="mut">${esc(x.eco_title||"")} e${x.freeze_epoch}</div></td>
+        <td>${CHECK_CN[x.check_type]||x.check_type}</td>
+        <td>${x.required?"是":'<span class="mut">否</span>'}</td>
+        <td class="mut">${x.depends_on.length?x.depends_on.map(d=>CHECK_CN[d]||d).join("，"):"—"}</td>
+        <td><button onclick="leaseClaimRun('${x.run_id}')">领取</button></td></tr>`).join("")
+      + "</table>"
+    : '<div class="mut">（暂无就绪任务——可能全部已领取、已完成，或依赖尚未通过）</div>';
+  // 当前租约
+  $("lz-leases").innerHTML = pool.leases.length
+    ? `<table><tr><th>run / 检查</th><th>状态</th><th>持有者</th><th>代次</th><th>剩余</th>
+           <th>TTL</th><th>操作</th></tr>` +
+      pool.leases.map(l=>{
+        const rem = l.remaining_seconds;
+        const remCls = l.state!=="HELD" ? "mut" : rem>15 ? "ok" : "bad";
+        const remTxt = l.state==="HELD" ? `${rem}s` : "—";
+        const acts = l.state==="HELD"
+          ? `<button onclick='leaseComplete(${JSON.stringify(l.run_id)},${JSON.stringify(l.check_type)},${JSON.stringify(l.eco_id)},${l.generation},${JSON.stringify(l.lease_token)},"PASS")'>交结果PASS</button>
+             <button class="danger" onclick='leaseComplete(${JSON.stringify(l.run_id)},${JSON.stringify(l.check_type)},${JSON.stringify(l.eco_id)},${l.generation},${JSON.stringify(l.lease_token)},"FAIL")'>FAIL</button>
+             <button class="sec" onclick="leaseRenew('${l.run_id}',${l.generation},${JSON.stringify(l.lease_token)})">续租</button>
+             <button class="sec" onclick="leaseRelease('${l.run_id}',${l.generation},${JSON.stringify(l.lease_token)})">释放</button>
+             <button class="danger" onclick="leaseTakeover('${l.run_id}')">超时接管</button>`
+          : (l.state==="EXPIRED"
+             ? `<button class="sec" onclick="leaseClaimRun('${l.run_id}')">重新领取</button>
+                <button class="danger" onclick="leaseTakeover('${l.run_id}')">接管</button>`
+             : "");
+        return `<tr>
+          <td class="mono">${l.run_id}</td>
+          <td><b>${LEASE_STATE_CN[l.state]||l.state}</b>${l.alive?"":""}</td>
+          <td>${esc(l.runner_id||"")}</td>
+          <td>g${l.generation}${l.renew_count?` <span class="mut">心跳${l.renew_count}</span>`:""}</td>
+          <td class="${remCls}">${remTxt}</td>
+          <td class="mut">${l.ttl_seconds}s</td>
+          <td>${acts}
+              <button class="sec" onclick="leaseHistory('${l.run_id}')">历史</button></td></tr>`;
+      }).join("") + "</table>"
+    : '<div class="mut">（暂无租约）</div>';
+  // 审计
+  $("lz-audit-count").textContent = `最近 ${au.count} 条`;
+  $("lz-audit").innerHTML = au.audit.length
+    ? `<table><tr><th>时间</th><th>事件</th><th>run</th><th>Runner</th><th>代次</th><th>拒绝原因</th></tr>` +
+      au.audit.map(h=>`<tr>
+        <td class="mut">${(h.at||"").slice(11)}</td>
+        <td>${h.event==="deny"?'<span class="bad">拒绝</span>':h.event}</td>
+        <td class="mono">${h.run_id?h.run_id.split(":").slice(1,3).join(":"):""}</td>
+        <td>${esc(h.runner_id||"")}</td>
+        <td>${h.generation??""}</td>
+        <td class="bad">${h.reason||""}</td></tr>`).join("") + "</table>"
+    : '<div class="mut">（暂无租约事件）</div>';
+}
+
 setDefaultTimes();
 refresh().catch(e=>toast(e.message,"err"));
+loadLeases().catch(e=>toast(e.message,"err"));

@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.api import _make_handler
+from app.lease import LeaseService
 from app.runner import compute_input_fingerprint
 from app.service import ECOService
 from app.store import Store
@@ -225,6 +226,163 @@ class ApiTest(unittest.TestCase):
                             "delegation_id": d3["id"]})
         self.assertEqual(s, 403)
         self.assertEqual(err["error"], "DELEGATION_NOT_STARTED")
+
+
+class LeaseApiTest(unittest.TestCase):
+    """租约协调器 HTTP 端到端：独立 API、幂等/并发/接管/审计。"""
+    @classmethod
+    def setUpClass(cls):
+        from datetime import datetime, timedelta, timezone
+        cls.base_now = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+        cls.clk = _Clock(cls.base_now)
+        store = Store(":memory:")
+        cls.svc = ECOService(store, now_fn=cls.clk)
+        cls.leases = LeaseService(cls.svc, ttl_seconds=3600, now_fn=cls.clk)
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", free_port()),
+                                        _make_handler(cls.svc, cls.leases))
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        cls.t = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.t.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+
+    def call(self, path, method="GET", body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        req = Request(self.base + path, data=data, method=method,
+                      headers={"Content-Type": "application/json"})
+        try:
+            with urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read())
+        except HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def _freeze(self, mod="l2c"):
+        s, d = self.call("/api/ecos", "POST", {
+            "title": "租约HTTP", "owner": "o", "affected_modules": [mod],
+            "edits": {mod: {"netlist": f"MODULE {mod}; CELL LEASE_HTTP; ENDMODULE"}}})
+        self.assertEqual(s, 201)
+        eid = d["id"]
+        self.call(f"/api/ecos/{eid}/freeze", "POST", {"by": "o"})
+        return eid
+
+    def test_pool_claim_idempotent_and_submit(self):
+        eid = self._freeze()
+        s, pool = self.call(f"/api/leases/pool?eco_id={eid}")
+        self.assertEqual(s, 200)
+        self.assertTrue(pool["claimable"])
+        run_id = next(x["run_id"] for x in pool["claimable"]
+                      if x["check_type"] == "TIMING_STA")
+        # 同一幂等键重放：返回同一份分配
+        s, c1 = self.call("/api/leases/claim", "POST",
+                          {"runner_id": "ci-1", "idempotency_key": "job-1",
+                           "run_id": run_id, "ttl_seconds": 120})
+        self.assertEqual(s, 200)
+        self.assertTrue(c1["claimed"])
+        s, c1b = self.call("/api/leases/claim", "POST",
+                           {"runner_id": "ci-1", "idempotency_key": "job-1",
+                            "run_id": run_id})
+        self.assertTrue(c1b["idempotent"])
+        self.assertEqual(c1b["run_id"], run_id)
+        # 另一 Runner 并发竞争同一 run
+        s, err = self.call("/api/leases/claim", "POST",
+                           {"runner_id": "ci-2", "idempotency_key": "job-2",
+                            "run_id": run_id})
+        self.assertEqual(s, 409)
+        self.assertEqual(err["error"], "LEASE_HELD_BY_OTHER")
+        # 凭据缺失/错误拒绝
+        s, pkt = self.call(f"/api/ecos/{eid}/checks/TIMING_STA/inputs")
+        fp = compute_input_fingerprint("TIMING_STA", pkt["inputs"])
+        s, err = self.call(f"/api/leases/runs/{run_id}/results", "POST",
+                           {"runner_id": "ci-1", "generation": c1["generation"],
+                            "lease_token": "0" * 32, "fingerprint": fp, "verdict": "PASS"})
+        self.assertEqual(s, 403)
+        self.assertEqual(err["error"], "LEASE_BAD_CREDENTIAL")
+        # 正确凭据回传
+        s, ok = self.call(f"/api/leases/runs/{run_id}/results", "POST",
+                          {"runner_id": "ci-1", "generation": c1["generation"],
+                           "lease_token": c1["lease_token"], "fingerprint": fp,
+                           "verdict": "PASS", "result": {"wns_ns": 0.2}})
+        self.assertEqual(s, 200, ok)
+        self.assertTrue(ok["accepted"])
+        self.assertEqual(ok["lease"]["state"], "COMPLETED")
+        # 租约状态与审计可查
+        s, st = self.call(f"/api/leases/runs/{run_id}")
+        self.assertTrue(any(h["event"] == "complete" for h in st["history"]))
+        s, au = self.call("/api/leases/audit?reason=LEASE_BAD_CREDENTIAL")
+        self.assertGreaterEqual(au["count"], 1)
+
+    def test_takeover_after_timeout_via_http(self):
+        eid = self._freeze("noc")
+        s, pool = self.call(f"/api/leases/pool?eco_id={eid}")
+        rid = next(x["run_id"] for x in pool["claimable"]
+                   if x["check_type"] == "TIMING_STA")
+        s, c = self.call("/api/leases/claim", "POST",
+                         {"runner_id": "slow-runner", "idempotency_key": "slow-1",
+                          "run_id": rid})
+        self.assertTrue(c["claimed"])
+        self.assertEqual(c["check_type"], "TIMING_STA")
+        # 未超时不可接管
+        s, err = self.call(f"/api/leases/runs/{rid}/takeover", "POST",
+                           {"by_runner": "fast-runner"})
+        self.assertEqual(s, 409)
+        self.assertEqual(err["error"], "LEASE_NOT_TIMED_OUT")
+        # 推进时钟过 TTL
+        self.clk.advance(3601)
+        s, t = self.call(f"/api/leases/runs/{rid}/takeover", "POST",
+                         {"by_runner": "fast-runner", "ttl_seconds": 300})
+        self.assertEqual(s, 200, t)
+        self.assertEqual(t["generation"], c["generation"] + 1)
+        # 旧持有者旧代次迟到结果被拒
+        s, pkt = self.call(f"/api/ecos/{eid}/checks/TIMING_STA/inputs")
+        fp = compute_input_fingerprint("TIMING_STA", pkt["inputs"])
+        s, err = self.call(f"/api/leases/runs/{rid}/results", "POST",
+                           {"runner_id": "slow-runner", "generation": c["generation"],
+                            "lease_token": c["lease_token"], "fingerprint": fp,
+                            "verdict": "PASS"})
+        self.assertEqual(s, 409)
+        self.assertEqual(err["error"], "LEASE_GENERATION_STALE")
+        # 新持有者：指纹被篡改仍受 ECO 门禁拒绝（接管不绕过）
+        s, bad = self.call(f"/api/leases/runs/{rid}/results", "POST",
+                           {"runner_id": "fast-runner", "generation": t["generation"],
+                            "lease_token": t["lease_token"], "fingerprint": "f" * 16,
+                            "verdict": "PASS"})
+        self.assertEqual(s, 409)
+        self.assertEqual(bad["detail"]["reason"], "FINGERPRINT_MISMATCH")
+        s, ok = self.call(f"/api/leases/runs/{rid}/results", "POST",
+                          {"runner_id": "fast-runner", "generation": t["generation"],
+                           "lease_token": t["lease_token"], "fingerprint": fp,
+                           "verdict": "PASS"})
+        self.assertEqual(s, 200, ok)
+
+    def test_leases_list_and_renew(self):
+        eid = self._freeze("core")
+        s, pool = self.call(f"/api/leases/pool?eco_id={eid}")
+        rid = next(x["run_id"] for x in pool["claimable"]
+                   if x["check_type"] == "FORMAL_EQUIV")
+        s, c = self.call("/api/leases/claim", "POST",
+                         {"runner_id": "rn", "idempotency_key": "renew-1",
+                          "run_id": rid})
+        s, r = self.call(f"/api/leases/runs/{rid}/renew", "POST",
+                         {"runner_id": "rn", "generation": c["generation"],
+                          "lease_token": c["lease_token"], "ttl_seconds": 600})
+        self.assertEqual(s, 200)
+        self.assertEqual(r["renew_count"], 1)
+        s, ls = self.call("/api/leases?state=HELD")
+        self.assertTrue(any(x["run_id"] == rid for x in ls["leases"]))
+
+
+class _Clock:
+    def __init__(self, t):
+        self.t = t
+
+    def __call__(self):
+        return self.t.isoformat(timespec="seconds")
+
+    def advance(self, seconds):
+        from datetime import timedelta
+        self.t += timedelta(seconds=seconds)
 
 
 if __name__ == "__main__":

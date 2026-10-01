@@ -182,6 +182,64 @@ CREATE TABLE IF NOT EXISTS audit_log (
     at              TEXT NOT NULL,
     detail_json     TEXT
 );
+
+-- ===== 验证执行租约协调（Lease Coordinator，与 ECO 服务共享同一落盘库）=====
+
+-- 每个 check_run 至多一条租约记录；generation 随续租代次（接管）单调递增。
+-- token 由服务端持久密钥 HMAC 派生（不落明文），旧持有者无法伪造新代次凭据。
+-- 重跑会生成新的 run_id（新 attempt）：旧 run 作废、其租约 INVALIDATED，新 run 从 gen=1 重新领取。
+CREATE TABLE IF NOT EXISTS check_lease (
+    seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           TEXT NOT NULL UNIQUE,
+    eco_id           TEXT NOT NULL,
+    check_type       TEXT NOT NULL,
+    generation       INTEGER NOT NULL DEFAULT 1,
+    runner_id        TEXT,
+    state            TEXT NOT NULL DEFAULT 'HELD',   -- HELD / COMPLETED / RELEASED / EXPIRED / INVALIDATED
+    ttl_seconds      INTEGER NOT NULL DEFAULT 120,
+    acquired_at      TEXT,
+    expires_at       TEXT,
+    last_heartbeat_at TEXT,
+    completed_at     TEXT,
+    finished_reason  TEXT,
+    renew_count      INTEGER NOT NULL DEFAULT 0,
+    token_nonce      TEXT NOT NULL                  -- 与持久密钥共同派生本代 token
+);
+CREATE INDEX IF NOT EXISTS idx_lease_state ON check_lease(state);
+
+-- 领取幂等键：同一 (runner, 幂等键) 永远只对应一次成功分配，重放/网络重试返回原分配
+CREATE TABLE IF NOT EXISTS lease_claim (
+    seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+    runner_id        TEXT NOT NULL,
+    idempotency_key  TEXT NOT NULL,
+    run_id           TEXT NOT NULL,
+    generation       INTEGER NOT NULL,
+    claimed_at       TEXT NOT NULL,
+    UNIQUE(runner_id, idempotency_key)
+);
+
+-- 租约事件审计：领取/续租/完成/释放/接管/回收，以及全部拒绝（原因可查询）
+CREATE TABLE IF NOT EXISTS lease_audit (
+    seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           TEXT,
+    eco_id           TEXT,
+    check_type       TEXT,
+    lease_seq        INTEGER,
+    generation       INTEGER,
+    runner_id        TEXT,
+    event            TEXT NOT NULL,                  -- claim/renew/complete/release/takeover/reclaim/deny
+    reason           TEXT,                           -- deny 时的拒收原因码
+    detail_json      TEXT,
+    at               TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lease_audit_run ON lease_audit(run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_lease_audit_reason ON lease_audit(reason);
+
+-- 租约协调器自身的持久元数据：当前仅保存 HMAC 密钥（重启后旧凭据仍可验真）
+CREATE TABLE IF NOT EXISTS lease_meta (
+    key              TEXT PRIMARY KEY,
+    value            TEXT NOT NULL
+);
 """
 
 
@@ -319,6 +377,7 @@ class Store:
         with self.tx() as c:
             for t in ["audit_log", "rejected_result", "release_journal", "release",
                       "adjudication", "queue_entry", "module_lock", "signoff_delegation",
-                      "signoff", "check_run", "eco", "constraint_event", "trunk", "baseline"]:
+                      "signoff", "check_run", "eco", "constraint_event", "trunk", "baseline",
+                      "lease_audit", "check_lease", "lease_claim"]:
                 c.execute(f"DELETE FROM {t}")
         self._seed()

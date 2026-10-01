@@ -40,7 +40,7 @@
 
 ```bash
 # 启动服务（默认 0.0.0.0:8080，SQLite 落盘 data/eco.db）
-python3 -m app.api --db data/eco.db --port 8080
+python3 -m app.api --db data/eco.db --port 8080 --lease-ttl 120
 
 # 浏览器打开签核工作台
 open http://localhost:8080
@@ -48,7 +48,7 @@ open http://localhost:8080
 # 命令行跑完 A/B/C/D 四个异常场景演示（内存库）
 python3 -m app.demo
 
-# 全部测试（48 个：领域单测 + 真实 HTTP 端到端，含临时代理签核不变量）
+# 全部测试（76 个：领域单测 + 租约协调不变量 + 真实 HTTP 端到端，含临时代理签核）
 python3 -m unittest discover -s tests -v
 ```
 
@@ -56,18 +56,20 @@ python3 -m unittest discover -s tests -v
 
 ```
 app/
-  store.py    SQLite schema/连接/种子基线 R0/检查目录(依赖与作用域)
+  store.py    SQLite schema/连接/种子基线 R0/检查目录(依赖与作用域)/租约与审计表
   service.py  领域核心：冻结指纹、依赖调度、排队合并、双签门禁、临时代理签核授权、两阶段发布、差异包
+  lease.py    验证执行租约协调：就绪任务领取(幂等/并发唯一)、续租、完成、释放、超时接管、代次+HMAC凭据门禁、重启恢复/回收
   runner.py   模拟验证 Runner（自行算指纹；可演示迟到/篡改）
-  api.py      stdlib HTTP REST 路由
+  api.py      stdlib HTTP REST 路由（ECO + 租约协调独立 API）
   demo.py     四场景端到端演示
 web/
-  index.html  签核工作台（代理配置、ECO 队列、门禁矩阵、签核、差异包、拒收留痕）
+  index.html  签核工作台（代理配置、ECO 队列、门禁矩阵、签核、差异包、拒收留痕、租约协调操作台）
   app.js      零依赖 JS；浏览器端用 WebCrypto 复算 Runner 指纹
 tests/
   test_service.py     24 个领域不变量测试
   test_delegation.py  18 个临时代理签核测试
-  test_api.py          6 个真实 socket HTTP 测试
+  test_lease.py       25 个租约协调不变量测试（幂等/并发/接管/代次凭据/重启恢复）
+  test_api.py          9 个真实 socket HTTP 测试（6 ECO/签核 + 3 租约端到端）
 ```
 
 ## ECO 状态机
@@ -94,6 +96,9 @@ DRAFT ──freeze(无锁冲突)──▶ FROZEN ──双签+发布──▶ RE
 - `POST /api/ecos/{src}/merge-into/{tgt}` · `POST /api/constraints`
 - 临时代理签核（管理员）：`POST /api/admin/delegations` ·
   `POST /api/admin/delegations/{id}/revoke` · `GET /api/current-signers`
+- 验证执行租约：`POST /api/leases/claim` ·
+  `POST /api/leases/runs/{run}/renew|release|takeover|results` ·
+  `GET  /api/leases/pool|/api/leases/runs/{run}|/api/leases/audit`
 - `GET  /api/workbench` · `GET /api/baselines/diff?from=&to=` · `.../diff.zip`
 - `POST /api/admin/reset`（演示数据重置）
 
@@ -118,8 +123,31 @@ DRAFT ──freeze(无锁冲突)──▶ FROZEN ──双签+发布──▶ RE
   仍将旧签核标记失效（`voided_at`），新纪元必须重签。
 - 工作台展示每角色**当前可签人员、代理来源与有效期**，并在 ECO 卡片提供"代理签核"按钮。
 
-## 差异包
+## 验证执行租约协调（`app/lease.py`）
 
+配套的租约协调模块把验证矩阵中**已就绪**的检查原子分配给 Runner，并提供独立 API
+与工作台面板 ⑥（待领任务 / 当前持有者 / 剩余时间 / 接管历史）。
+
+- **就绪发现**：只暴露 `PENDING` 且 ECO=FROZEN 的活动 run；`BLOCKED`（依赖未满足）、
+  已作废（`SUPERSEDED`）、已有结论的 run 不可领取。
+- **领取幂等 + 并发唯一**：`claim(runner_id, idempotency_key)` 对同一键的重放/并发
+  返回同一份分配（不重复发租约）；不同 Runner 抢同一 run 仅一个成功
+  （`BEGIN IMMEDIATE` + `UNIQUE(run_id)` 串行化，落败方 `LEASE_HELD_BY_OTHER`）。
+- **代次 + 不可伪造凭据**：每次领取/接管返回 `generation` 与 `lease_token`
+  （持久密钥对 `(run_id, generation, nonce)` 的 HMAC-SHA256，密钥存 `lease_meta`，
+  不落明文）。回传必须回带二者。旧持有者（被接管后拿旧代次）、错误 Runner、
+  伪造凭据、过期租约、依赖未满足、**重跑后旧代次迟到结果**、无租约直交全部拒绝，
+  拒绝写 `lease_audit`，可按 run/reason 查询。
+- **续租 / 释放 / 超时接管**：续租刷新 `expires_at`（代次不变）；持有者可主动释放回池；
+  接管**只允许在 TTL 过期后**，代次 +1、nonce/token 换新，旧持有者凭据即刻失效。
+- **落盘与恢复**：租约、幂等键、审计、HMAC 密钥全部在 SQLite。进程重启恢复未过期
+  租约（旧 token 仍验真），回收已过期/随纪元作废的租约并写 `reclaim` 审计。
+- **不绕过既有门禁**：租约校验通过后，结果仍交给 `ECOService.submit_result`——
+  接管回来的结果一样要过**基线指纹**与**依赖门禁**，重跑（旧 attempt SUPERSEDED、
+  新 attempt 重新绑指纹）、双角色签核、两阶段发布的约束全部保持；租约置 COMPLETED
+  与 check_run 落定在同一数据库事务内，要么一起成功要么一起回滚。
+
+## 差异包
 `GET /api/baselines/diff.zip?from=B-R1&to=B-R3` 产出：
 
 ```

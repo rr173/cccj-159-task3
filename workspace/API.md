@@ -18,6 +18,35 @@
   - `ECO_NOT_ACTIVE` ECO 不在 FROZEN 态
   - `BASE_CONSTRAINT_CHANGED` 基础约束更新导致在验单整体作废（系统事件留痕）
 
+### 验证执行租约（Lease Coordinator）
+
+Runner 对验证矩阵中**已经就绪**（`check_run=PENDING` 且 ECO=FROZEN）的检查执行
+领取/续租/完成/超时接管。每次领取返回 **`generation`（租约代次）**与
+**`lease_token`（不可伪造凭据）**：token 为服务端持久密钥对
+`(run_id, generation, nonce)` 的 HMAC，不落明文、重启后仍可验真。
+
+- 领取**幂等**：同一 `(runner_id, idempotency_key)` 的重放/并发请求至多成功一次，
+  其余返回同一份分配（`claimed:false, idempotent:true`）；不同 Runner 并发领取同一
+  run 仅一个成功（`409 LEASE_HELD_BY_OTHER`）。
+- 回传结果必须携带正确的 `generation + lease_token`。被接管后的旧持有者（旧代次）、
+  错误 Runner、伪造/缺失凭据、过期租约、依赖未满足、重跑后旧代次迟到结果、
+  无租约直交结果一律拒绝；拒绝写 `lease_audit`（可按 run / reason 查询）。
+- 租约/审计落盘：重启后**恢复未过期租约**（旧 token 仍有效）并**回收过期/随纪元
+  失效租约**（写 `reclaim` 审计）。
+- **接管不绕过门禁**：租约通过后，结果仍调用原 ECO 服务 `submit_result`，
+  `FINGERPRINT_MISMATCH / DEPENDENCY_BLOCKED / STALE_SUPERSEDED / ALREADY_SUBMITTED`
+  等拒收语义、重跑/签核/发布约束全部保持不变；租约完成与 check_run 落定在**同一事务**。
+
+租约原因码：`LEASE_HELD_BY_OTHER`（并发竞争落败）、`LEASE_TASK_NOT_READY`
+（依赖未满足/非 PENDING）、`LEASE_TASK_SUPERSEDED`（run 已因重跑/纪元作废）、
+`LEASE_TASK_FINISHED`、`LEASE_NOT_FOUND`（无有效租约）、`LEASE_GENERATION_STALE`
+（代次落后，典型为被接管后的旧持有者/重跑后旧代次迟到）、`LEASE_NOT_HOLDER`、
+`LEASE_BAD_CREDENTIAL`(403)、`LEASE_EXPIRED`、`LEASE_NOT_ACTIVE`、
+`LEASE_NOT_TIMED_OUT`（未过期不可接管）、`LEASE_NOT_TAKEOVERABLE`、
+`LEASE_RUN_SUPERSEDED`、`LEASE_TASK_INVALIDATED`。租约状态：
+`HELD / COMPLETED / RELEASED / EXPIRED / INVALIDATED`。
+
+
 ### 临时代理签核授权
 
 管理员可为两种签核角色（`TIMING_LEAD / METHODOLOGY_LEAD`）配置**临时代理人**及其
@@ -73,6 +102,32 @@
 
 Runner **必须**对 `inputs` 自行按作用域计算 SHA-256 摘要（紧凑规范 JSON：
 键排序、无空白、`ensure_ascii`），服务端不接受缺失/不符指纹。
+
+### 验证执行租约协调
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/leases/pool?eco_id=` | 待领任务（就绪 PENDING）+ 全部租约（持有者/状态/剩余秒） |
+| POST | `/api/leases/claim` | `{runner_id, idempotency_key?, run_id?, ttl_seconds?}` 原子领取；幂等；不指定 run_id 则领取下一个就绪任务；无任务返回 `claimed:false` |
+| POST | `/api/leases/runs/{run_id}/renew` | `{runner_id, generation, lease_token, ttl_seconds?}` 续租（心跳），代次不变、续期计数+1 |
+| POST | `/api/leases/runs/{run_id}/release` | `{runner_id, generation, lease_token}` 持有者主动释放，任务回池，代次+1 后可再领 |
+| POST | `/api/leases/runs/{run_id}/takeover` | `{by_runner, ttl_seconds?}` **仅超时后**可接管；代次+1、凭据换新，旧持有者即刻失效 |
+| POST | `/api/leases/runs/{run_id}/results` | `{runner_id, generation, lease_token, fingerprint, verdict, result}` 租约门禁通过后仍走 ECO 基线指纹/依赖门禁 |
+| GET | `/api/leases/runs/{run_id}` | 租约状态 + 剩余秒 + **接管/事件历史** |
+| GET | `/api/leases?state=` | 全部租约（可按状态过滤） |
+| GET | `/api/leases/audit?run_id=&reason=&limit=` | 租约事件与拒绝原因审计（claim/renew/complete/release/takeover/reclaim/deny） |
+
+领取成功返回示例（后续续租/释放/回传均回带 `generation` 与 `lease_token`）：
+
+```json
+{ "claimed": true, "idempotent": false, "run_id": "ECO-001:TIMING_STA:e1:a1",
+  "eco_id": "ECO-001", "check_type": "TIMING_STA", "generation": 1,
+  "runner_id": "runner-0", "state": "HELD", "ttl_seconds": 120,
+  "expires_at": "2026-10-01T12:02:00+00:00", "remaining_seconds": 120,
+  "lease_token": "9f2c…(32hex)",
+  "inputs_path": "/api/ecos/ECO-001/checks/TIMING_STA/inputs",
+  "result_path": "/api/leases/runs/ECO-001:TIMING_STA:e1:a1/results" }
+```
+
 
 ### 签核与发布
 | 方法 | 路径 | 说明 |
