@@ -182,6 +182,58 @@ CREATE TABLE IF NOT EXISTS audit_log (
     at              TEXT NOT NULL,
     detail_json     TEXT
 );
+
+-- ===== 验证执行租约协调（与 ECO 服务配套的租约层）=====
+-- 每个 check_run 至多一条当前租约行（run_id UNIQUE）；gen 为租约代次，
+-- 每次接管 +1，用于拒绝旧持有者的迟到结果/续租。token 以 HMAC 派生（服务密钥
+-- 存 lease_meta），库内仅留 SHA-256 摘要，凭据不可伪造也不会因落盘泄露明文。
+CREATE TABLE IF NOT EXISTS check_lease (
+    run_id          TEXT PRIMARY KEY,
+    eco_id          TEXT NOT NULL,
+    check_type      TEXT NOT NULL,
+    gen             INTEGER NOT NULL DEFAULT 1,
+    runner_id       TEXT NOT NULL,
+    state           TEXT NOT NULL,            -- HELD/COMPLETED/RELEASED/EXPIRED/INVALIDATED
+    token_hash      TEXT NOT NULL,
+    acquired_at     TEXT NOT NULL,
+    expires_at      TEXT NOT NULL,
+    renewed_count   INTEGER NOT NULL DEFAULT 0,
+    completed_at    TEXT,
+    completion_verdict TEXT,
+    detail_json     TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_lease_eco ON check_lease(eco_id);
+CREATE INDEX IF NOT EXISTS idx_lease_state ON check_lease(state);
+
+-- 领取请求幂等键：相同 key 重放返回首次的租约授权（含原始 gen/凭据），
+-- 全局唯一索引是并发下“重复领取至多生效一次”的最终防线。
+CREATE TABLE IF NOT EXISTS lease_claim (
+    idempotency_key TEXT PRIMARY KEY,
+    run_id          TEXT NOT NULL,
+    runner_id       TEXT NOT NULL,
+    claimed_at      TEXT NOT NULL,
+    grant_json      TEXT NOT NULL             -- 首次授权响应快照（含 token 明文，仅此处分发）
+);
+
+-- 租约生命周期/接管历史（可查询审计）
+CREATE TABLE IF NOT EXISTS lease_event (
+    seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id          TEXT,
+    eco_id          TEXT,
+    check_type      TEXT,
+    gen             INTEGER,
+    event           TEXT NOT NULL,            -- CLAIM/RENEW/COMPLETE/RELEASE/EXPIRE/TAKEOVER/INVALIDATE/REJECT
+    actor           TEXT,
+    at              TEXT NOT NULL,
+    detail_json     TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_lease_event_run ON lease_event(run_id, seq);
+
+-- 租约层自身的键值元数据（HMAC 密钥在首次启动时生成并落盘，重启后旧凭据仍可校验）
+CREATE TABLE IF NOT EXISTS lease_meta (
+    k               TEXT PRIMARY KEY,
+    v               TEXT NOT NULL
+);
 """
 
 
@@ -319,6 +371,7 @@ class Store:
         with self.tx() as c:
             for t in ["audit_log", "rejected_result", "release_journal", "release",
                       "adjudication", "queue_entry", "module_lock", "signoff_delegation",
-                      "signoff", "check_run", "eco", "constraint_event", "trunk", "baseline"]:
+                      "signoff", "check_run", "eco", "constraint_event", "trunk", "baseline",
+                      "lease_event", "lease_claim", "check_lease"]:
                 c.execute(f"DELETE FROM {t}")
         self._seed()

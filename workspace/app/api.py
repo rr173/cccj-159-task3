@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 from .service import ECOError, ECOService
 from .store import Store
+from .leases import LeaseError, LeaseService
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -21,7 +22,8 @@ _MIME = {".html": "text/html; charset=utf-8", ".js": "application/javascript; ch
          ".css": "text/css; charset=utf-8", ".json": "application/json"}
 
 
-def _make_handler(svc: ECOService):
+def _make_handler(svc: ECOService, lease_svc: LeaseService | None = None):
+    lease_svc = lease_svc or LeaseService(svc.s, svc)
     class Handler(BaseHTTPRequestHandler):
         server_version = "ChipECO/1.0"
 
@@ -59,6 +61,13 @@ def _make_handler(svc: ECOService):
             qs = parse_qs(urlparse(self.path).query)
             return cast(qs[name][0]) if name in qs else default
 
+        @staticmethod
+        def _gen(b):
+            try:
+                return int(b["gen"])
+            except (KeyError, TypeError, ValueError):
+                raise ECOError("BAD_REQUEST", "gen 必须是整数（租约代次）", 400)
+
         # ---- 静态资源 ----
         def _static(self, rel):
             p = (WEB_DIR / rel).resolve()
@@ -74,6 +83,8 @@ def _make_handler(svc: ECOService):
             try:
                 if path == "/":
                     return self._static("index.html")
+                if path == "/ops":
+                    return self._static("ops.html")
                 if path.startswith("/static/"):
                     return self._static(path[len("/static/"):])
                 # 更具体的字面路径先于参数化模式匹配
@@ -117,8 +128,18 @@ def _make_handler(svc: ECOService):
                     return self._send(200, svc.get_delegation(int(m.group(1))))
                 if path == "/api/current-signers":
                     return self._send(200, svc.current_signers())
+                # ---- 验证执行租约协调 ----
+                if path == "/api/leases/board":
+                    return self._send(200, lease_svc.lease_board())
+                if path == "/api/leases/audit":
+                    return self._send(200, lease_svc.audit_events(
+                        run_id=self._q("run_id"), event=self._q("event"),
+                        reason=self._q("reason"), limit=self._q("limit", 200, int)))
+                m = re.fullmatch(r"/api/leases/runs/(.+)", path)
+                if m:
+                    return self._send(200, lease_svc.lease(m.group(1)))
                 self._send(404, {"error": "NOT_FOUND", "message": path})
-            except ECOError as e:
+            except (ECOError, LeaseError) as e:
                 self._err(e)
 
         def do_POST(self):
@@ -186,20 +207,54 @@ def _make_handler(svc: ECOService):
                 if path == "/api/constraints":
                     return self._send(200, svc.update_base_constraints(
                         b["delta"], b.get("by", "?"), b.get("note", "")))
+                # ---- 验证执行租约协调（独立 API）----
+                if path == "/api/leases/claims":
+                    d = lease_svc.claim(
+                        b.get("runner_id", ""), run_id=b.get("run_id"),
+                        idempotency_key=b.get("idempotency_key"),
+                        ttl_seconds=b.get("ttl_seconds"))
+                    return self._send(200 if d.get("replayed") else 201, d)
+                m = re.fullmatch(r"/api/leases/runs/(.+)/renew", path)
+                if m:
+                    return self._send(200, lease_svc.renew(
+                        m.group(1), self._gen(b), b.get("lease_token"),
+                        b.get("runner_id", ""), b.get("ttl_seconds")))
+                m = re.fullmatch(r"/api/leases/runs/(.+)/complete", path)
+                if m:
+                    d = lease_svc.complete(
+                        m.group(1), self._gen(b), b.get("lease_token"),
+                        b.get("fingerprint", ""), b.get("verdict"),
+                        b.get("result"), b.get("runner_id"))
+                    return self._send(200, d)
+                m = re.fullmatch(r"/api/leases/runs/(.+)/takeover", path)
+                if m:
+                    return self._send(201, lease_svc.takeover(
+                        m.group(1), b.get("runner_id", ""), b.get("ttl_seconds")))
+                m = re.fullmatch(r"/api/leases/runs/(.+)/release", path)
+                if m:
+                    return self._send(200, lease_svc.release(
+                        m.group(1), self._gen(b), b.get("lease_token"),
+                        b.get("runner_id", ""), b.get("note", "")))
                 self._send(404, {"error": "NOT_FOUND", "message": path})
             except KeyError as e:
                 self._err(ECOError("BAD_REQUEST", f"缺少字段: {e}", 400))
-            except ECOError as e:
+            except (ECOError, LeaseError) as e:
                 self._err(e)
 
     return Handler
 
 
-def serve(db_path=":memory:", port=8080):
+def serve(db_path=":memory:", port=8080, lease_ttl_seconds=600):
     store = Store(db_path)
     svc = ECOService(store)
-    httpd = ThreadingHTTPServer(("0.0.0.0", port), _make_handler(svc))
+    lease_svc = LeaseService(store, svc, ttl_seconds=lease_ttl_seconds)
+    # 进程启动：恢复未过期租约，回收已过期租约（落盘租约跨重启存活）
+    rec = lease_svc.recover()
+    httpd = ThreadingHTTPServer(("0.0.0.0", port), _make_handler(svc, lease_svc))
     print(f"ECO 基线服务已启动: http://localhost:{port}  (db={db_path})")
+    print(f"租约协调: 恢复未过期 {rec['restored_held']} 条，回收过期 {len(rec['recovered_expired'])} 条，"
+          f"对账 {rec['reconciled']} 条")
+    print(f"Runner 操作页: http://localhost:{port}/ops")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -210,5 +265,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="data/eco.db")
     ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--lease-ttl", type=int, default=600,
+                    help="租约默认 TTL（秒），30~3600")
     args = ap.parse_args()
-    serve(args.db, args.port)
+    serve(args.db, args.port, args.lease_ttl)

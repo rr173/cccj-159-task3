@@ -36,19 +36,50 @@
 - **依赖图**：`LAYOUT_DRC` 依赖 `TIMING_STA`+`POWER_ANALYSIS`，前置未 PASS 时保持
   `BLOCKED`，提前提交以 `DEPENDENCY_BLOCKED` 拒收；前置 FAIL 不会解锁下游。
 
+## 验证执行租约协调（Runner 层）
+
+多 Runner 并发从验证矩阵领取检查时，由独立的租约层（`app/leases.py`）协调执行权，
+操作页见 `/ops`，API 前缀 `/api/leases`：
+
+- **只发就绪任务**：待领池只含 FROZEN ECO 上 `PENDING`（依赖前置已 PASS）的检查；
+  显式领取 `BLOCKED` 任务以 `DEPENDENCY_NOT_READY` 拒绝。
+- **领取幂等 + 原子单赢家**：`POST /api/leases/claims` 携带 `idempotency_key`，相同键
+  重放返回**首次**授权（`replayed:true`，不新增代次/事件）；领取在单个
+  `BEGIN IMMEDIATE` 事务内裁决，唯一索引兜底，并发领取同一任务只有一个成功，其余
+  `LEASE_HELD_BY_OTHER`（含持有者与剩余秒数）。
+- **续租/完成/释放/接管**：`renew` 延长 TTL；`complete` 携带 `gen + lease_token +
+  fingerprint` 回传结果；`release` 主动让出；TTL 过期后其他 runner 可 `takeover`，
+  **租约代次 +1** 并返回新凭据，旧持有者的续租/结果立即以 `STALE_LEASE_GEN` 拒收
+  （重跑产生新 run 后，旧代次迟到结果同样被拒，记 `STALE_SUPERSEDED`）。
+- **不可伪造凭据**：token = `HMAC-SHA256(server_secret, run_id:gen:runner_id)`
+  截断 16hex，仅在领取/接管响应中分发一次；库内只存 SHA-256 摘要。服务密钥落盘
+  `lease_meta`，重启后旧凭据对未过期租约仍有效。伪造/篡改 token → 403
+  `LEASE_BAD_CREDENTIAL`。
+- **拒绝全留痕**：租约层拒绝写 `lease_event(REJECT)`（`/api/leases/audit` 可按
+  run / 事件类型 / 原因码查询），看板 `recent_rejects` 同步展示。
+- **落盘与重启恢复**：租约、幂等键、事件全部 SQLite 落盘；启动 `recover()` 恢复未过期
+  HELD 租约、回收过期租约为 EXPIRED，并对账 run 已在租约层之外结束/作废的租约
+  （COMPLETED/INVALIDATED）；运行期每次租约操作还会惰性回收，无需后台线程。
+- **不绕过 ECO 门禁**：租约凭据校验与 `submit_result` 在**同一个数据库事务**内执行，
+  接管后的结果仍必须通过原服务的冻结指纹（`FINGERPRINT_MISMATCH`）、纪元作废
+  （`STALE_SUPERSEDED`）、依赖门禁（`DEPENDENCY_BLOCKED`），FAIL 仍只能走既有
+  `rerun`，双签与两阶段发布约束完全不变；ECO 侧 `rejected_result` 与租约侧审计双侧留痕。
+
 ## 快速开始
 
 ```bash
-# 启动服务（默认 0.0.0.0:8080，SQLite 落盘 data/eco.db）
-python3 -m app.api --db data/eco.db --port 8080
+# 启动服务（默认 0.0.0.0:8080，SQLite 落盘 data/eco.db，租约默认 TTL 600s）
+python3 -m app.api --db data/eco.db --port 8080 --lease-ttl 600
 
 # 浏览器打开签核工作台
 open http://localhost:8080
+# Runner 验证执行租约操作页（待领/持有者/剩余时间/接管/审计）
+open http://localhost:8080/ops
 
 # 命令行跑完 A/B/C/D 四个异常场景演示（内存库）
 python3 -m app.demo
 
-# 全部测试（48 个：领域单测 + 真实 HTTP 端到端，含临时代理签核不变量）
+# 全部测试（73 个：领域单测 + 租约协调不变量 + 真实 HTTP 端到端，含临时代理签核不变量）
 python3 -m unittest discover -s tests -v
 ```
 
@@ -56,18 +87,22 @@ python3 -m unittest discover -s tests -v
 
 ```
 app/
-  store.py    SQLite schema/连接/种子基线 R0/检查目录(依赖与作用域)
+  store.py    SQLite schema/连接/种子基线 R0/检查目录(依赖与作用域)/租约与租约审计表
   service.py  领域核心：冻结指纹、依赖调度、排队合并、双签门禁、临时代理签核授权、两阶段发布、差异包
+  leases.py   验证执行租约协调：幂等领取(原子单赢家)、续租、代次+HMAC凭据完成、超时接管、重启恢复
   runner.py   模拟验证 Runner（自行算指纹；可演示迟到/篡改）
-  api.py      stdlib HTTP REST 路由
+  api.py      stdlib HTTP REST 路由（ECO + 租约两组 API）
   demo.py     四场景端到端演示
 web/
   index.html  签核工作台（代理配置、ECO 队列、门禁矩阵、签核、差异包、拒收留痕）
   app.js      零依赖 JS；浏览器端用 WebCrypto 复算 Runner 指纹
+  ops.html    Runner 租约操作页（待领任务、持有者与剩余时间、超时接管、接管历史、拒绝审计）
+  ops.js      租约领取/续租/完成/释放/接管；token 仅领取时分发，localStorage 保存授权
 tests/
   test_service.py     24 个领域不变量测试
   test_delegation.py  18 个临时代理签核测试
-  test_api.py          6 个真实 socket HTTP 测试
+  test_leases.py      22 个租约协调不变量测试（并发单赢家/幂等/代次凭据/接管/重跑迟到/重启恢复）
+  test_api.py          9 个真实 socket HTTP 测试（含租约领取-接管-完成端到端）
 ```
 
 ## ECO 状态机
@@ -91,6 +126,9 @@ DRAFT ──freeze(无锁冲突)──▶ FROZEN ──双签+发布──▶ RE
 - `POST /api/ecos` · `POST /api/ecos/{id}/freeze|abort|signoff|release|release/resume`
 - `GET  /api/ecos/{id}/checks/{type}/inputs`（Runner 拉冻结输入）
 - `POST /api/ecos/{id}/checks/{type}/results|rerun`
+- 验证执行租约：`POST /api/leases/claims` ·
+  `POST /api/leases/runs/{run_id}/renew|complete|takeover|release` ·
+  `GET  /api/leases/board|audit|runs/{run_id}`（操作页 `/ops`）
 - `POST /api/ecos/{src}/merge-into/{tgt}` · `POST /api/constraints`
 - 临时代理签核（管理员）：`POST /api/admin/delegations` ·
   `POST /api/admin/delegations/{id}/revoke` · `GET /api/current-signers`

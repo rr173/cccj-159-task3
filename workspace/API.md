@@ -18,6 +18,33 @@
   - `ECO_NOT_ACTIVE` ECO 不在 FROZEN 态
   - `BASE_CONSTRAINT_CHANGED` 基础约束更新导致在验单整体作废（系统事件留痕）
 
+### 验证执行租约（Runner 协调层）
+
+与 ECO 服务配套的租约层负责“谁在哪一代次可以提交哪个检查”，**不改变** ECO 侧门禁：
+租约凭据有效只代表“有权投递”，结果仍由原 `/results` 同一套裁决落库（指纹 / 纪元 /
+依赖 / 重跑 / 签核 / 发布），接管不可能绕过任何一项。
+
+- 租约字段：`state=HELD/COMPLETED/RELEASED/EXPIRED/INVALIDATED`、`gen`（租约代次，
+  每次接管/超时重领 +1）、`runner_id`、`acquired_at/expires_at/remaining_seconds`。
+- **凭据**：CLAIM/TAKEOVER 返回一次性 `lease_token`（16hex，
+  `HMAC-SHA256(server_secret, run_id:gen:runner_id)`），服务端密钥落盘 `lease_meta`，
+  库内只存 SHA-256 摘要；完成/续租必须携带 `gen + lease_token`。
+- **领取幂等**：相同 `idempotency_key` 重放返回首次授权（HTTP 200、`replayed:true`）；
+  幂等键被其他 runner/任务占用 → 409 `IDEMPOTENCY_KEY_REUSED`；并发领取同一任务只有一个
+  成功，其余 409 `LEASE_HELD_BY_OTHER`。
+- 租约层拒收原因：`STALE_LEASE_GEN`（代次过期：已被接管/重领，旧持有者迟到结果）、
+  `LEASE_BAD_CREDENTIAL`（凭据不符/伪造，403）、`LEASE_EXPIRED`（TTL 过期）、
+  `LEASE_NOT_EXPIRED`（未到期不可强制接管）、`LEASE_NOT_HELD_BY_RUNNER`（非持有者）、
+  `LEASE_ALREADY_COMPLETED` / `LEASE_RELEASED`、`LEASE_NOT_FOUND`、
+  `DEPENDENCY_NOT_READY`（依赖前置未 PASS，任务不在待领池）、`NO_CLAIMABLE_TASK`、
+  `RUN_SUPERSEDED`；指纹/依赖等 ECO 门禁拒绝时**透传 ECO 原始原因码**
+  （`FINGERPRINT_MISMATCH` / `STALE_SUPERSEDED` / `DEPENDENCY_BLOCKED` …）。
+- 所有拒绝同时写入租约审计 `lease_event(event=REJECT)`（可按 run/事件/原因查询）
+  与 ECO 侧 `rejected_result`。
+- 进程重启：未过期租约恢复为 HELD（密钥落盘，旧凭据继续可用），已过期租约回收为
+  EXPIRED 可接管；运行期每次租约操作还会惰性对账（超时回收、run 已结束/作废对账）。
+- 操作页：`GET /ops`（待领任务、当前持有者与剩余时间、可接管池、接管历史、拒绝审计）。
+
 ### 临时代理签核授权
 
 管理员可为两种签核角色（`TIMING_LEAD / METHODOLOGY_LEAD`）配置**临时代理人**及其
@@ -73,6 +100,28 @@
 
 Runner **必须**对 `inputs` 自行按作用域计算 SHA-256 摘要（紧凑规范 JSON：
 键排序、无空白、`ensure_ascii`），服务端不接受缺失/不符指纹。
+
+### 验证执行租约（Runner 协调协议）
+| 方法 | 路径 | Body / 说明 |
+|---|---|---|
+| POST | `/api/leases/claims` | `{runner_id, run_id?, idempotency_key?, ttl_seconds?}`；不给 `run_id` 则原子挑一个依赖已就绪任务；成功 201，幂等重放 200。返回 `{gen, lease_token, expires_at, remaining_seconds, taken_over?, previous_holder?}` |
+| POST | `/api/leases/runs/{run_id}/renew` | `{gen, lease_token, runner_id, ttl_seconds?}` 续租；旧代次/过期/非持有者拒绝 |
+| POST | `/api/leases/runs/{run_id}/complete` | `{gen, lease_token, fingerprint, verdict, result?, runner_id?}` 代次+凭据校验与 ECO 指纹/依赖门禁**同一事务**裁决；拒绝原因透传 ECO 原码 |
+| POST | `/api/leases/runs/{run_id}/takeover` | `{runner_id, ttl_seconds?}` 仅 EXPIRED 可接管；gen+1，旧持有者凭据立即失效 |
+| POST | `/api/leases/runs/{run_id}/release` | `{gen, lease_token, runner_id, note?}` 持有者主动释放，任务回到待领池 |
+| GET | `/api/leases/board` | 看板：`claimable / held(剩余秒) / takeover_available / takeover_history / recent_rejects / all_leases` |
+| GET | `/api/leases/runs/{run_id}` | 单条租约状态与完整事件流 |
+| GET | `/api/leases/audit?run_id=&event=&reason=&limit=` | 租约可查询审计（CLAIM/RENEW/COMPLETE/RELEASE/EXPIRE/TAKEOVER/INVALIDATE/REJECT/RECOVER）|
+
+`ttl_seconds` 取值 30~3600，默认 600（可用 `--lease-ttl` 调整）。典型 Runner 时序：
+
+```
+POST /claims            → gen=1, lease_token（仅本次返回，客户端保存）
+GET  .../inputs → 自算指纹
+POST .../complete       → {gen:1, lease_token, fingerprint, verdict}
+（任务卡住超过 TTL）其他 runner: POST .../takeover → gen=2, 新 token
+旧 runner 用 gen=1+旧 token 迟到提交 → 409 STALE_LEASE_GEN（lease_event 留痕）
+```
 
 ### 签核与发布
 | 方法 | 路径 | 说明 |

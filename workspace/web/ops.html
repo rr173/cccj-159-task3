@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>验证执行租约 · Runner 操作页</title>
+<style>
+  :root { --bg:#0f1522; --panel:#182030; --line:#2a3550; --txt:#dbe4f3;
+          --mut:#8494b3; --ok:#2fbf71; --bad:#e0556b; --warn:#e3a73a;
+          --accent:#4f8cff; --block:#6b7894; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:13px/1.55 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",monospace;
+         background:var(--bg); color:var(--txt); }
+  header { padding:14px 22px; border-bottom:1px solid var(--line); display:flex;
+           align-items:center; gap:14px; background:#121a29; }
+  header h1 { font-size:16px; margin:0; }
+  header .meta { color:var(--mut); font-size:12px; }
+  a { color:var(--accent); text-decoration:none; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:5px;
+           padding:5px 11px; cursor:pointer; font-size:12px; }
+  button.sec { background:#2c3a55; } button.danger{background:var(--bad);}
+  button.warn{background:#a9741a;}
+  button:disabled { background:#333d52; color:#7c88a1; cursor:not-allowed; }
+  input,select { background:#0d1320; color:var(--txt); border:1px solid var(--line);
+           border-radius:4px; padding:5px 8px; font-size:12px; font-family:inherit; }
+  .wrap { padding:14px 22px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+           padding:14px; margin-bottom:14px; }
+  .panel h2 { font-size:13px; margin:0 0 10px; color:#9fb4da; letter-spacing:1px;
+              text-transform:uppercase; display:flex; justify-content:space-between; align-items:center;}
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:6px 0; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:20px; font-size:11px; }
+  .s-HELD{background:#1e4a7a;color:#cfe3ff} .s-COMPLETED{background:#155a38;color:#bdf3d5}
+  .s-RELEASED{background:#37425c;color:#c6d0e6} .s-EXPIRED{background:#5c3b1e;color:#ffd8b0}
+  .s-INVALIDATED{background:#4a202a;color:#f3c3cd}
+  .chip { font-size:11px; padding:1px 7px; border:1px solid var(--line); border-radius:20px;color:var(--mut);}
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  td,th { padding:4px 6px; border-bottom:1px solid #222d44; text-align:left; vertical-align:top;}
+  th { color:var(--mut); font-weight:600; }
+  .mut{color:var(--mut)} .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+  #toast { position:fixed; right:18px; bottom:18px; max-width:460px; display:flex;
+           flex-direction:column; gap:8px; z-index:9; }
+  .toast { padding:9px 13px; border-radius:7px; background:#20304d; border:1px solid var(--line);
+           font-size:12px; } .toast.err{border-color:var(--bad);} .toast.ok{border-color:var(--ok);}
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .ticker { animation:pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.45} }
+</style>
+</head>
+<body>
+<header>
+  <h1>🏃 验证执行租约 · Runner 操作页</h1>
+  <span class="meta" id="meta"></span>
+  <span style="flex:1"></span>
+  <a class="chip" href="/">← 返回签核工作台</a>
+  <button class="sec" onclick="refresh()">立即刷新</button>
+  <label class="mut"><input type="checkbox" id="autoref" checked/> 5s 自动刷新</label>
+</header>
+
+<div class="wrap">
+  <div class="panel">
+    <h2>Runner 身份与领取参数
+      <span class="mut" style="text-transform:none">领取是幂等操作：同一 idempotency_key 重放返回同一授权；并发领取只有一个成功</span></h2>
+    <div class="row">
+      <label class="mut">runner_id <input id="runner" value="runner-01"/></label>
+      <label class="mut">TTL(秒) <input id="ttl" type="number" value="300" min="30" max="3600" style="width:90px"/></label>
+      <label class="mut">幂等键 <input id="idem" style="width:260px" placeholder="留空则每次自动生成 UUID"/></label>
+      <button class="sec" onclick="genIdem()">生成幂等键</button>
+    </div>
+    <div class="row mut">结果回传必须携带 <b>gen（租约代次）</b> 与 <b>lease_token（HMAC 凭据，仅领取时返回一次）</b>；
+      接管 / 重跑会使代次 +1，旧持有者的迟到结果一律拒收。</div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>① 待领任务（依赖已就绪 PENDING）</h2>
+      <div class="row"><button onclick="claimAny()">自动领取一个就绪任务</button></div>
+      <div id="claimable"></div>
+    </div>
+    <div class="panel">
+      <h2>② 当前持有者（HELD · 剩余时间）</h2>
+      <div id="held"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>③ 超时可接管任务</h2>
+    <div class="row mut">TTL 到期后任务回到此池；接管使租约代次 +1，旧 runner 的凭据立即失效。</div>
+    <div id="takeover"></div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>④ 接管 / 超时 / 作废历史</h2>
+      <div id="history"></div>
+    </div>
+    <div class="panel">
+      <h2>⑤ 租约层拒绝审计（含 ECO 门禁透传原因）</h2>
+      <div id="rejects"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>⑥ 全部租约</h2>
+    <div id="all"></div>
+  </div>
+</div>
+<div id="toast"></div>
+<script src="/static/ops.js"></script>
+</body>
+</html>

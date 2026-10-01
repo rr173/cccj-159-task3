@@ -7,17 +7,32 @@
   B. 验证结果迟到 / 基础约束更新途中到来：拒收，ECO 须 rebase 重跑
   C. 两个 ECO 修改重叠模块：排队 + 合并裁决，旧结果作废
   D. 发布中断：RELEASING 持久化，resume 原子恢复；中断期间禁止任何变更
-  E. 临时代理签核：配置/撤销，动作时授权校验拒绝未生效/过期/撤销，同一人禁双签
+  E. 验证执行租约：幂等领取/并发单赢家、超时接管代次+1、旧持有者与伪造凭据结果拒收
+  F. 临时代理签核：配置/撤销，动作时授权校验拒绝未生效/过期/撤销，同一人禁双签
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from .runner import gate_status, run_all_pending, submit
+from .runner import gate_status, run_all_pending, submit, compute_input_fingerprint
 from .service import ECOError, ECOService, ROLE_METHOD, ROLE_TIMING
+from .leases import LeaseError, LeaseService
 from .store import Store
 
 LINE = "=" * 78
+
+
+class Clock:
+    """演示用可控时钟：租约超时/接管需要确定性的时间推进。"""
+    def __init__(self, t):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, **kw):
+        self.t += timedelta(**kw)
+        return self.t
 
 
 def hr(title):
@@ -33,12 +48,17 @@ def expect_reject(fn, label):
     try:
         fn()
         print(f"   !! 异常：{label} 竟然被接受")
-    except ECOError as e:
-        print(f"   ✓ 按预期拒收 [{e.extra.get('reason', e.code)}]: {e.message}")
+    except (ECOError, LeaseError) as e:
+        reason = e.extra.get("reason", e.code) if getattr(e, "extra", None) else e.code
+        print(f"   ✓ 按预期拒收 [{reason}]: {e.message}")
 
 
 def main():
-    svc = ECOService(Store(":memory:"))
+    # 演示钟锚定当前时刻：代理签核的“动作时校验”与租约 TTL 推进共用同一时钟
+    clk = Clock(datetime.now(timezone.utc).replace(microsecond=0))
+    store = Store(":memory:")
+    svc = ECOService(store, now_fn=clk)
+    leases = LeaseService(store, svc, now_fn=clk, ttl_seconds=300)
     # ---------------- A. 正常流 ----------------
     hr("A. 正常流：时序修复 ECO 冻结 → 依赖图检查 → 双签核 → 发布 R1")
     e1 = svc.create_eco(
@@ -160,9 +180,58 @@ def main():
     print(f"   5) 差异包 {pkg['from']['id']}→{pkg['to']['id']}: 模块变更 "
           f"{pkg['summary']['modules_changed']}，双角色={pkg['verification']['dual_role_distinct_users']}")
 
-    # ---------------- E. 临时代理签核 ----------------
-    hr("E. 临时代理签核：动作时授权校验 + 同一自然人禁双签 + 重新冻结失效")
-    now = datetime.now(timezone.utc)
+    # ---------------- E. 验证执行租约协调 ----------------
+    hr("E. 验证执行租约：幂等领取/并发单赢家 → 超时接管 → 旧代次迟到拒收（不绕过指纹门禁）")
+    f = svc.create_eco("ALU 租约调度演示", "dev.f", ["alu"],
+                       {"alu": {"netlist": "MODULE alu; CELL LEASE_DEMO; ENDMODULE"}})
+    svc.freeze_eco(f["id"], "dev.f")
+    print(f"   1) {f['id']} 冻结，待领池:",
+          [c["check_type"] for c in leases.lease_board()["claimable"]],
+          "（LAYOUT_DRC 依赖未满足，不在池中）")
+    sta_run = svc.s.q_one(
+        "SELECT id FROM check_run WHERE eco_id=? AND check_type='TIMING_STA' AND status='PENDING'",
+        (f["id"],))["id"]
+    g1 = leases.claim("runner-A", run_id=sta_run, idempotency_key="f-sta-1", ttl_seconds=300)
+    g1b = leases.claim("runner-A", run_id=sta_run, idempotency_key="f-sta-1", ttl_seconds=300)
+    print(f"   2) runner-A 领取 {g1['check_type']} gen={g1['gen']}；同幂等键重放 "
+          f"replayed={g1b['replayed']}，token/代次不变")
+    expect_reject(lambda: leases.claim("runner-B", run_id=sta_run),
+                  "runner-B 在租约未过期时并发领取同一任务")
+
+    print("   3) TTL 推进 301 秒（模拟 runner-A 卡死）…")
+    clk.advance(seconds=301)
+    board = leases.lease_board()
+    print("      可接管任务:", [t["run_id"] for t in board["takeover_available"]
+                          if t["eco_id"] == f["id"]])
+    g2 = leases.takeover(sta_run, "runner-B", ttl_seconds=300)
+    print(f"   4) runner-B 超时接管成功：gen {g2['previous_gen']}→{g2['gen']}，"
+          f"旧持有者 {g2['previous_holder']} 的凭据立即失效")
+    pkt = svc.check_inputs(f["id"], "TIMING_STA")
+    fp = compute_input_fingerprint("TIMING_STA", pkt["inputs"])
+    expect_reject(lambda: leases.complete(sta_run, g1["gen"], g1["lease_token"], fp,
+                                          "PASS", runner_id="runner-A"),
+                  "runner-A 用旧代次+旧凭据迟到回传")
+    expect_reject(lambda: leases.complete(sta_run, g2["gen"], "0" * 16, fp,
+                                          "PASS", runner_id="runner-B"),
+                  "伪造凭据的接管者提交")
+    expect_reject(lambda: leases.complete(sta_run, g2["gen"], g2["lease_token"],
+                                          "deadbeefdeadbeef", "PASS", runner_id="runner-B"),
+                  "凭据有效但指纹不符（租约层不绕过基线指纹门禁）")
+    ok = leases.complete(sta_run, g2["gen"], g2["lease_token"], fp, "PASS",
+                         runner_id="runner-B")
+    print(f"   5) runner-B 凭 gen={ok['lease']['gen']} 凭据 + 正确指纹完成 → "
+          f"lease={ok['lease']['state']}，run 已由 ECO 服务落库")
+    aud = leases.audit_events(run_id=sta_run)["events"]
+    print("   6) 租约审计事件流:", [(e["event"], e["actor"], e["gen"]) for e in
+          sorted(aud, key=lambda x: x["seq"]) if e["event"] != "REJECT"])
+    print("      拒绝审计:", [(e["detail"]["reason"], e["actor"]) for e in aud
+          if e["event"] == "REJECT"])
+    print("      ECO 侧 rejected_result:", [r["reason"] for r in svc.rejected_results()
+          if r["run_id"] == sta_run])
+
+    # ---------------- F. 临时代理签核 ----------------
+    hr("F. 临时代理签核：动作时授权校验 + 同一自然人禁双签 + 重新冻结失效")
+    now = clk.t
     iso = lambda dt: dt.isoformat(timespec="seconds")
     e5 = svc.create_eco("L2C 功耗保持修复", "dev.e", ["l2c"],
                         {"l2c": {"netlist": "MODULE l2c; CELL RETENTION u_r; ENDMODULE"}})
@@ -212,6 +281,8 @@ def main():
         chain = s["auth_chain"]
         extra = f" 代 {chain['principal_user']}" if chain["kind"] == "DELEGATE" else "（本人）"
         print(f"        {s['role']}: {s['user']} [{s['signoff_kind']}]{extra}")
+
+    # ---------------- F(租约) 已提前在 E 之前演示 ----------------
 
     hr("全部场景完成。拒收留痕(最近 5 条):")
     for r in svc.rejected_results()[:5]:

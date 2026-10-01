@@ -227,5 +227,169 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(err["error"], "DELEGATION_NOT_STARTED")
 
 
+class LeaseApiTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from app.leases import LeaseService
+        cls.svc = ECOService(Store(":memory:"))
+        cls.leases = LeaseService(cls.svc.s, cls.svc, ttl_seconds=300)
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", free_port()),
+                                        _make_handler(cls.svc, cls.leases))
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        cls.t = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.t.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+
+    def call(self, path, method="GET", body=None, raw=False):
+        data = json.dumps(body).encode() if body is not None else None
+        req = Request(self.base + path, data=data, method=method,
+                      headers={"Content-Type": "application/json"})
+        try:
+            with urlopen(req, timeout=5) as r:
+                payload = r.read()
+                if raw:
+                    return r.status, payload
+                return r.status, json.loads(payload)
+        except HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def _frozen(self):
+        s, d = self.call("/api/ecos", "POST", {
+            "title": "租约 HTTP 流", "owner": "net.eng", "affected_modules": ["core"],
+            "edits": {"core": {"netlist": "MODULE core; CELL LEASE_HTTP; ENDMODULE"}}})
+        self.assertEqual(s, 201)
+        eid = d["id"]
+        self.call(f"/api/ecos/{eid}/freeze", "POST", {"by": "net.eng"})
+        return eid
+
+    def test_claim_complete_flow_via_http(self):
+        eid = self._frozen()
+        s, board = self.call("/api/leases/board")
+        self.assertEqual(s, 200)
+        self.assertIn("claimable", board)
+        types = {c["check_type"] for c in board["claimable"]}
+        self.assertIn("TIMING_STA", types)
+        self.assertNotIn("LAYOUT_DRC", types)  # 依赖未满足，不进待领池
+
+        # 自动领取一个任务
+        s, g1 = self.call("/api/leases/claims", "POST",
+                          {"runner_id": "ci-1", "idempotency_key": "http-1",
+                           "ttl_seconds": 300})
+        self.assertEqual(s, 201)
+        rid = g1["run_id"]
+        # 幂等重放：200 + 同 gen/token
+        s, g1b = self.call("/api/leases/claims", "POST",
+                           {"runner_id": "ci-1", "idempotency_key": "http-1"})
+        self.assertEqual(s, 200)
+        self.assertTrue(g1b["replayed"])
+        self.assertEqual(g1b["lease_token"], g1["lease_token"])
+        # 并发语义：另一 runner 领取同 run 被拒
+        s, err = self.call("/api/leases/claims", "POST",
+                           {"runner_id": "ci-2", "run_id": rid})
+        self.assertEqual(s, 409)
+        self.assertEqual(err["error"], "LEASE_HELD_BY_OTHER")
+        # 缺凭据完成 → 400
+        s, err = self.call(f"/api/leases/runs/{rid}/complete", "POST",
+                           {"gen": 1, "fingerprint": "x", "verdict": "PASS",
+                            "runner_id": "ci-1"})
+        self.assertEqual(s, 400)
+        self.assertEqual(err["error"], "MISSING_LEASE_TOKEN")
+        # 错误代次 → 409 STALE_LEASE_GEN
+        s, err = self.call(f"/api/leases/runs/{rid}/complete", "POST",
+                           {"gen": 9, "lease_token": g1["lease_token"],
+                            "fingerprint": "x", "verdict": "PASS", "runner_id": "ci-1"})
+        self.assertEqual(s, 409)
+        self.assertEqual(err["error"], "STALE_LEASE_GEN")
+
+        # 拉输入、自算指纹、带租约代次+凭据完成
+        s, pkt = self.call(f"/api/ecos/{eid}/checks/{g1['check_type']}/inputs")
+        fp = compute_input_fingerprint(g1["check_type"], pkt["inputs"])
+        s, done = self.call(f"/api/leases/runs/{rid}/complete", "POST",
+                            {"gen": g1["gen"], "lease_token": g1["lease_token"],
+                             "fingerprint": fp, "verdict": "PASS", "runner_id": "ci-1",
+                             "result": {"note": "lease http ok"}})
+        self.assertEqual(s, 200, done)
+        self.assertTrue(done["accepted"])
+        self.assertEqual(done["lease"]["state"], "COMPLETED")
+
+        # 看板 + 审计可查
+        s, board = self.call("/api/leases/board")
+        self.assertTrue(all(h["run_id"] != rid for h in board["held"]))
+        s, audit = self.call(f"/api/leases/audit?run_id={rid}")
+        self.assertTrue(any(e["event"] == "CLAIM" for e in audit["events"]))
+        self.assertTrue(any(e["event"] == "COMPLETE" for e in audit["events"]))
+
+    def test_takeover_after_expiry_via_http(self):
+        from datetime import datetime, timedelta, timezone
+        # 用注入时钟的独立服务，精确控制过期
+        from app.leases import LeaseService
+        t0 = datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+        class Clk:
+            def __init__(self):
+                self.t = t0
+            def __call__(self):
+                return self.t
+
+        clk = Clk()
+        svc = ECOService(Store(":memory:"), now_fn=clk)
+        leases = LeaseService(svc.s, svc, now_fn=clk, ttl_seconds=30)
+        httpd = ThreadingHTTPServer(("127.0.0.1", free_port()), _make_handler(svc, leases))
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+        def call(path, method="GET", body=None):
+            data = json.dumps(body).encode() if body is not None else None
+            req = Request(base + path, data=data, method=method,
+                          headers={"Content-Type": "application/json"})
+            try:
+                with urlopen(req, timeout=5) as r:
+                    return r.status, json.loads(r.read())
+            except HTTPError as e:
+                return e.code, json.loads(e.read())
+
+        s, d = call("/api/ecos", "POST", {
+            "title": "接管流", "owner": "o", "affected_modules": ["alu"],
+            "edits": {"alu": {"netlist": "MODULE alu; CELL TAKEOVER; ENDMODULE"}}})
+        eid = d["id"]
+        call(f"/api/ecos/{eid}/freeze", "POST", {"by": "o"})
+        s, g = call("/api/leases/claims", "POST",
+                    {"runner_id": "old-runner", "ttl_seconds": 30})
+        rid = g["run_id"]
+        # 未过期不能接管
+        s, err = call(f"/api/leases/runs/{rid}/takeover", "POST", {"runner_id": "new-runner"})
+        self.assertEqual(s, 409)
+        self.assertEqual(err["error"], "LEASE_NOT_EXPIRED")
+        clk.t += timedelta(seconds=31)
+        # 看板中该任务出现在可接管列表
+        s, board = call("/api/leases/board")
+        self.assertTrue(any(t["run_id"] == rid for t in board["takeover_available"]))
+        s, g2 = call(f"/api/leases/runs/{rid}/takeover", "POST",
+                     {"runner_id": "new-runner", "ttl_seconds": 60})
+        self.assertEqual(s, 201)
+        self.assertEqual(g2["gen"], 2)
+        self.assertEqual(g2["previous_holder"], "old-runner")
+        # 旧持有者旧凭据结果被拒
+        s, pkt = call(f"/api/ecos/{eid}/checks/{g['check_type']}/inputs")
+        fp = compute_input_fingerprint(g["check_type"], pkt["inputs"])
+        s, err = call(f"/api/leases/runs/{rid}/complete", "POST",
+                      {"gen": g["gen"], "lease_token": g["lease_token"],
+                       "fingerprint": fp, "verdict": "PASS", "runner_id": "old-runner"})
+        self.assertEqual(s, 409)
+        self.assertEqual(err["error"], "STALE_LEASE_GEN")
+        # 接管历史可查
+        s, hist = call("/api/leases/audit?event=TAKEOVER")
+        self.assertTrue(any(e["run_id"] == rid for e in hist["events"]))
+        httpd.shutdown()
+
+    def test_ops_page_served(self):
+        s, data = self.call("/ops", raw=True)
+        self.assertEqual(s, 200)
+        self.assertIn("租约".encode(), data)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -408,58 +408,70 @@ class ECOService:
             }
 
     def submit_result(self, run_id, fingerprint, verdict, result=None, runner_id="runner-0"):
-        """提交验证结果。指纹不符 / 已作废 / 前置未过 / 重复提交一律拒收，绝不复用。
+        """提交验证结果（自带事务的公开入口）。指纹不符 / 已作废 / 前置未过 / 重复提交一律拒收。
 
-        拒收记录在独立事务中持久化：校验事务回滚不影响审计留痕。
+        租约层（app.leases）在其外层事务中调用 _apply_result 以保证“凭据校验 + 门禁裁决”
+        原子完成；两条路径共用同一套拒收逻辑，租约层不可能绕过任何门禁。
         """
         result = result or {}
         try:
             with self.s.tx() as c:
-                run = c.execute("SELECT * FROM check_run WHERE id=?", (run_id,)).fetchone()
-                if not run:
-                    raise ECOError("RUN_NOT_FOUND", f"运行 {run_id} 不存在", 404)
-                eco = c.execute("SELECT * FROM eco WHERE id=?", (run["eco_id"],)).fetchone()
-
-                def reject(reason, detail):
-                    raise ECOError("RESULT_REJECTED",
-                                   f"结果拒收: {reason}（旧结果不得拼接复用）", 409,
-                                   {"reason": reason, **detail})
-
-                if run["status"] == "SUPERSEDED":
-                    reject("STALE_SUPERSEDED",
-                           {"run_id": run_id, "eco_freeze_epoch": eco["freeze_epoch"]})
-                if eco["status"] != "FROZEN":
-                    reject("ECO_NOT_ACTIVE", {"eco_status": eco["status"]})
-                if verdict not in ("PASS", "FAIL"):
-                    reject("BAD_VERDICT", {"verdict": verdict})
-                if not fingerprint:
-                    reject("MISSING_FINGERPRINT", {})
-                if fingerprint != run["expected_fp"]:
-                    reject("FINGERPRINT_MISMATCH",
-                           {"submitted_fp": fingerprint, "expected_fp": run["expected_fp"],
-                            "check_type": run["check_type"]})
-                if run["status"] == "BLOCKED":
-                    reject("DEPENDENCY_BLOCKED",
-                           {"depends_on": json.loads(run["depends_on_json"])})
-                if run["status"] in ("PASS", "FAIL"):
-                    reject("ALREADY_SUBMITTED", {"existing": run["status"]})
-
-                c.execute(
-                    "UPDATE check_run SET status=?,result_fp=?,result_json=?,submitted_at=?,"
-                    "runner_id=? WHERE id=?",
-                    (verdict, fingerprint, json.dumps(result, ensure_ascii=False), utcnow(),
-                     runner_id, run_id))
-                self._audit(c, "check.result", run_id, runner_id,
-                            {"verdict": verdict, "check": run["check_type"]})
-                self._advance(c, run["eco_id"])
-                return self.eco_detail(run["eco_id"], c)
+                return self._apply_result(c, run_id, fingerprint, verdict, result, runner_id)
         except ECOError as e:
-            if e.code == "RESULT_REJECTED":
-                with self.s.tx() as c:
-                    r = c.execute("SELECT * FROM check_run WHERE id=?", (run_id,)).fetchone()
-                    self._reject(e.extra.get("reason", "REJECTED"), r,
-                                 {k: v for k, v in e.extra.items() if k != "reason"})
+            self._record_result_rejection(run_id, e)
             raise
+
+    def _record_result_rejection(self, run_id, e: ECOError):
+        """拒收留痕（独立事务）：校验事务回滚不影响 rejected_result 审计。"""
+        if e.code == "RESULT_REJECTED":
+            with self.s.tx() as c:
+                r = c.execute("SELECT * FROM check_run WHERE id=?", (run_id,)).fetchone()
+                self._reject(e.extra.get("reason", "REJECTED"), r,
+                             {k: v for k, v in e.extra.items() if k != "reason"})
+
+    def _apply_result(self, c, run_id, fingerprint, verdict, result, runner_id):
+        """在给定事务游标上执行结果落库与门禁裁决，返回 ECO 详情。
+
+        拒收统一抛 ECOError("RESULT_REJECTED", extra={"reason": ...})，由调用方负责留痕。
+        """
+        run = c.execute("SELECT * FROM check_run WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            raise ECOError("RUN_NOT_FOUND", f"运行 {run_id} 不存在", 404)
+        eco = c.execute("SELECT * FROM eco WHERE id=?", (run["eco_id"],)).fetchone()
+
+        def reject(reason, detail):
+            raise ECOError("RESULT_REJECTED",
+                           f"结果拒收: {reason}（旧结果不得拼接复用）", 409,
+                           {"reason": reason, **detail})
+
+        if run["status"] == "SUPERSEDED":
+            reject("STALE_SUPERSEDED",
+                   {"run_id": run_id, "eco_freeze_epoch": eco["freeze_epoch"]})
+        if eco["status"] != "FROZEN":
+            reject("ECO_NOT_ACTIVE", {"eco_status": eco["status"]})
+        if verdict not in ("PASS", "FAIL"):
+            reject("BAD_VERDICT", {"verdict": verdict})
+        if not fingerprint:
+            reject("MISSING_FINGERPRINT", {})
+        if fingerprint != run["expected_fp"]:
+            reject("FINGERPRINT_MISMATCH",
+                   {"submitted_fp": fingerprint, "expected_fp": run["expected_fp"],
+                    "check_type": run["check_type"]})
+        if run["status"] == "BLOCKED":
+            reject("DEPENDENCY_BLOCKED",
+                   {"depends_on": json.loads(run["depends_on_json"])})
+        if run["status"] in ("PASS", "FAIL"):
+            reject("ALREADY_SUBMITTED", {"existing": run["status"]})
+
+        c.execute(
+            "UPDATE check_run SET status=?,result_fp=?,result_json=?,submitted_at=?,"
+            "runner_id=? WHERE id=?",
+            (verdict, fingerprint, json.dumps(result, ensure_ascii=False), utcnow(),
+             runner_id, run_id))
+        self._audit(c, "check.result", run_id, runner_id,
+                    {"verdict": verdict, "check": run["check_type"]})
+        self._advance(c, run["eco_id"])
+        return self.eco_detail(run["eco_id"], c)
 
     def rerun_check(self, eco_id, check_type, by):
         """FAIL 的检查可重跑：旧尝试标记 SUPERSEDED，新尝试重新绑定当前冻结指纹。"""
